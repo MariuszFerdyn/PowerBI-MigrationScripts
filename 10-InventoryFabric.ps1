@@ -97,6 +97,26 @@ catch {
     throw "Not signed in to Power BI. Run 'Connect-PowerBIServiceAccount' first, then re-run this script."
 }
 
+# Emits a "could not read" warning. If the error is Unauthorized (401/403), it
+# appends a hint: that status is USUALLY harmless (a workspace you can enumerate
+# but not read, e.g. someone else's personal workspace) but CAN signal a real
+# problem (expired/insufficient token, revoked admin role, Conditional Access/MFA
+# block, or a workspace not on a Fabric capacity you can access).
+function Write-ReadWarning {
+    param(
+        [string]$What,        # e.g. 'items'
+        [string]$Workspace,
+        [string]$Message
+    )
+    $line = "Could not read $What in '$Workspace': $Message"
+    if ($Message -match 'Unauthorized|401|403') {
+        $line += " [Unauthorized - usually just a workspace you can't read (e.g. a personal workspace); "
+        $line += "but if this appears for workspaces you SHOULD be able to read, or for all of them, "
+        $line += "check your sign-in/admin role and workspace access.]"
+    }
+    Write-Warning $line
+}
+
 # --- Helper: GET a Fabric API URL, following continuationToken pagination ----
 function Invoke-FabricGetAll {
     param(
@@ -134,7 +154,7 @@ if ($WorkspaceId -and $WorkspaceId.Count -gt 0) {
             $workspaces.Add($ws)
         }
         catch {
-            Write-Warning "Could not read workspace '$id': $($_.Exception.Message)"
+            Write-ReadWarning -What 'workspace' -Workspace $id -Message $_.Exception.Message
         }
     }
 }
@@ -172,7 +192,7 @@ foreach ($ws in $workspaces) {
         }
     }
     catch {
-        Write-Warning "Could not read items in '$wsName' ($wsId): $($_.Exception.Message)"
+        Write-ReadWarning -What 'items' -Workspace "$wsName ($wsId)" -Message $_.Exception.Message
     }
 }
 
