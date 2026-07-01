@@ -41,6 +41,15 @@
 .PARAMETER BackupPath
     Root folder for -Backup output. Defaults to .\PowerBIBackup_<timestamp>.
 
+.PARAMETER UseScannerApi
+    Inventory via the admin metadata Scanner API instead of the per-workspace
+    cmdlets. This reads metadata INSIDE personal workspaces (and any workspace
+    you are not a member of), so it lists items the normal cmdlets return
+    'Unauthorized' for. Inventory only - cannot be combined with -Backup.
+    Requires Fabric admin rights AND the tenant setting that enables the
+    read-only admin APIs. Note: the Scanner API is limited to 30 scan calls
+    per hour per tenant.
+
 # -----------------------------------------------------------------------------
 #  SETUP & USAGE
 # -----------------------------------------------------------------------------
@@ -78,6 +87,10 @@
 #         .\01-InventoryPowerBI.ps1 -Backup
 #         .\01-InventoryPowerBI.ps1 -Backup -BackupPath D:\PBIBackup
 #
+#    Inventory INCLUDING inside personal workspaces (admin Scanner API):
+#         .\01-InventoryPowerBI.ps1 -UseScannerApi
+#         .\01-InventoryPowerBI.ps1 -UseScannerApi -CsvPath .\pbi-inventory-full.csv
+#
 #    Everything together:
 #         .\01-InventoryPowerBI.ps1 -IncludePersonalWorkspace -CsvPath .\pbi-inventory.csv
 #
@@ -114,7 +127,10 @@ param(
     [switch]$Backup,                       # Download .pbix / .rdl / dataflow .json for every exportable item
 
     [Parameter()]
-    [string]$BackupPath = ''                # Root folder for -Backup output (default: .\PowerBIBackup_<timestamp>)
+    [string]$BackupPath = '',               # Root folder for -Backup output (default: .\PowerBIBackup_<timestamp>)
+
+    [Parameter()]
+    [switch]$UseScannerApi                  # Inventory via the admin Scanner API (reads inside personal workspaces; Fabric admin required)
 )
 
 # --- Variables -------------------------------------------------------------
@@ -143,6 +159,27 @@ function Get-SafeName {
     ($Name -replace $pattern, '_').Trim()
 }
 
+# Emits a "could not read" warning. If the error is an Unauthorized (403/401),
+# it appends a hint, because that status is USUALLY harmless (a workspace you can
+# enumerate but not read, e.g. someone else's personal workspace) but CAN signal
+# a real problem (expired/insufficient token, revoked admin role, Conditional
+# Access/MFA block, or the read-only admin-API tenant setting being disabled).
+function Write-ReadWarning {
+    param(
+        [string]$What,        # e.g. 'reports'
+        [string]$Workspace,
+        [string]$Message
+    )
+    $line = "Could not read $What in '$Workspace': $Message"
+    if ($Message -match 'Unauthorized|401|403') {
+        $line += " [Unauthorized - usually just a workspace you can't read (e.g. a personal workspace); "
+        $line += "but if this appears for workspaces you SHOULD be able to read, or for all of them, "
+        $line += "check your sign-in/admin role and the admin-API tenant setting. To read inside personal "
+        $line += "workspaces use -UseScannerApi.]"
+    }
+    Write-Warning $line
+}
+
 # --- Ensure module is available --------------------------------------------
 if (-not (Get-Module -ListAvailable -Name MicrosoftPowerBIMgmt)) {
     throw "MicrosoftPowerBIMgmt module not found. Install with: Install-Module MicrosoftPowerBIMgmt -Scope CurrentUser"
@@ -157,23 +194,121 @@ catch {
     throw "Not signed in to Power BI. Run 'Connect-PowerBIServiceAccount' first, then re-run this script."
 }
 
-# --- Get workspaces --------------------------------------------------------
-# -Scope Organization requires tenant admin rights; falls back to user scope.
-try {
-    $workspaces = Get-PowerBIWorkspace -Scope Organization -All
-    Write-Host "Enumerating as tenant administrator (Organization scope)." -ForegroundColor Green
-}
-catch {
-    Write-Host "Admin scope unavailable; using individual (user) scope." -ForegroundColor Yellow
-    $workspaces = Get-PowerBIWorkspace -All
+# --- Scanner API workflow (admin metadata scan) -----------------------------
+# Runs the async GetModifiedWorkspaces -> PostWorkspaceInfo -> GetScanStatus ->
+# GetScanResult sequence and returns a flat list of item records. This reads
+# metadata INSIDE personal workspaces where the standard cmdlets return
+# 'Unauthorized'. Requires Fabric admin rights.
+function Get-InventoryViaScanner {
+    $base = 'https://api.powerbi.com/v1.0/myorg/admin/workspaces'
+
+    # 1. All workspace Ids (omit modifiedSince to get everything).
+    Write-Host "Scanner: listing modified workspaces..." -ForegroundColor Cyan
+    $modified = Invoke-PowerBIRestMethod -Url "$base/modified" -Method Get | ConvertFrom-Json
+    $wsIds = @($modified | ForEach-Object { $_.id })
+    if ($wsIds.Count -eq 0) {
+        Write-Warning "Scanner returned no workspaces."
+        return @()
+    }
+    Write-Host ("Scanner: {0} workspace(s) to scan." -f $wsIds.Count) -ForegroundColor Green
+
+    $items = [System.Collections.Generic.List[object]]::new()
+
+    # Process in batches of up to 100 workspace Ids (API limit).
+    $batchSize = 100
+    for ($i = 0; $i -lt $wsIds.Count; $i += $batchSize) {
+        $end   = [Math]::Min($i + $batchSize - 1, $wsIds.Count - 1)
+        $batch = $wsIds[$i..$end]
+        Write-Host ("Scanner: batch {0} ({1} workspaces)..." -f ([int]($i / $batchSize) + 1), $batch.Count) -ForegroundColor Cyan
+
+        # 2. Start the scan. Request lineage/datasource detail off to keep it light.
+        # Force @() so a single-Id batch still serializes as a JSON array.
+        $body = @{ workspaces = @($batch) } | ConvertTo-Json -Depth 4
+        if ($batch.Count -eq 1) {
+            # ConvertTo-Json can collapse a 1-element array to a scalar; rebuild explicitly.
+            $body = '{"workspaces":["' + $batch[0] + '"]}'
+        }
+        $post = Invoke-PowerBIRestMethod -Url "$base/getInfo?lineage=False&datasourceDetails=False&datasetSchema=False&datasetExpressions=False&getArtifactUsers=False" `
+                    -Method Post -Body $body -ContentType 'application/json' | ConvertFrom-Json
+        $scanId = $post.id
+
+        # 3. Poll status until Succeeded/Failed.
+        $status = 'Running'
+        $tries  = 0
+        while ($status -notin @('Succeeded', 'Failed') -and $tries -lt 60) {
+            Start-Sleep -Seconds 2
+            $st = Invoke-PowerBIRestMethod -Url "$base/scanStatus/$scanId" -Method Get | ConvertFrom-Json
+            $status = $st.status
+            $tries++
+        }
+        if ($status -ne 'Succeeded') {
+            Write-Warning "Scanner: batch scan did not succeed (status '$status'); skipping batch."
+            continue
+        }
+
+        # 4. Fetch the result and flatten items per workspace.
+        $result = Invoke-PowerBIRestMethod -Url "$base/scanResult/$scanId" -Method Get | ConvertFrom-Json
+        foreach ($w in $result.workspaces) {
+            $wsName = if ($w.name) { $w.name } else { $w.id }
+
+            foreach ($r in @($w.reports)) {
+                $t = if ($r.reportType -eq 'PaginatedReport') { 'PaginatedReport' } else { 'Report' }
+                $items.Add([pscustomobject]@{ Workspace = $wsName; Type = $t; Name = $r.name; Id = $r.id; WebUrl = $null })
+            }
+            foreach ($d in @($w.datasets)) {
+                $items.Add([pscustomobject]@{ Workspace = $wsName; Type = 'SemanticModel'; Name = $d.name; Id = $d.id; WebUrl = $null })
+            }
+            foreach ($db in @($w.dashboards)) {
+                $items.Add([pscustomobject]@{ Workspace = $wsName; Type = 'Dashboard'; Name = $db.displayName; Id = $db.id; WebUrl = $null })
+            }
+            foreach ($df in @($w.dataflows)) {
+                $items.Add([pscustomobject]@{ Workspace = $wsName; Type = 'Dataflow'; Name = $df.name; Id = $df.objectId; WebUrl = $null })
+            }
+            foreach ($dm in @($w.datamarts)) {
+                $items.Add([pscustomobject]@{ Workspace = $wsName; Type = 'Datamart'; Name = $dm.name; Id = $dm.id; WebUrl = $null })
+            }
+        }
+    }
+
+    return $items
 }
 
-if ($IncludePersonalWorkspace) {
+if ($UseScannerApi) {
+    if ($Backup) {
+        throw "-UseScannerApi is inventory-only and cannot be combined with -Backup (the Scanner API returns metadata, not downloadable files)."
+    }
+    try {
+        $scanned = Get-InventoryViaScanner
+        foreach ($rec in $scanned) { $results.Add($rec) }
+    }
+    catch {
+        throw "Scanner API failed (Fabric admin rights and the 'admin API' tenant setting are required): $($_.Exception.Message)"
+    }
+}
+
+# --- Get workspaces --------------------------------------------------------
+# (Skipped entirely in scanner mode - $results is already populated.)
+# -Scope Organization requires tenant admin rights; falls back to user scope.
+if ($UseScannerApi) {
+    $workspaces = @()   # Empty so the per-workspace loop below is a no-op.
+}
+else {
+    try {
+        $workspaces = Get-PowerBIWorkspace -Scope Organization -All
+        Write-Host "Enumerating as tenant administrator (Organization scope)." -ForegroundColor Green
+    }
+    catch {
+        Write-Host "Admin scope unavailable; using individual (user) scope." -ForegroundColor Yellow
+        $workspaces = Get-PowerBIWorkspace -All
+    }
+}
+
+if ($IncludePersonalWorkspace -and -not $UseScannerApi) {
     # Add a synthetic entry representing the signed-in user's own "My Workspace"
     $workspaces = @($workspaces) + ([pscustomobject]@{ Id = $null; Name = 'My Workspace' })
 }
 
-if ($AllPersonalWorkspaces) {
+if ($AllPersonalWorkspaces -and -not $UseScannerApi) {
     # Every user's personal workspace (type PersonalGroup). Admin-only.
     try {
         $personal = Get-PowerBIWorkspace -Scope Organization -Type PersonalGroup -All
@@ -265,7 +400,7 @@ foreach ($ws in $workspaces) {
         }
     }
     catch {
-        Write-Warning "Could not read reports in '$wsName': $($_.Exception.Message)"
+        Write-ReadWarning -What 'reports' -Workspace $wsName -Message $_.Exception.Message
     }
 
     # Semantic models (datasets)
@@ -282,7 +417,7 @@ foreach ($ws in $workspaces) {
         }
     }
     catch {
-        Write-Warning "Could not read semantic models in '$wsName': $($_.Exception.Message)"
+        Write-ReadWarning -What 'semantic models' -Workspace $wsName -Message $_.Exception.Message
     }
 
     # Dashboards
@@ -321,7 +456,7 @@ foreach ($ws in $workspaces) {
         }
     }
     catch {
-        Write-Warning "Could not read dashboards in '$wsName': $($_.Exception.Message)"
+        Write-ReadWarning -What 'dashboards' -Workspace $wsName -Message $_.Exception.Message
     }
 
     # Dataflows
@@ -361,7 +496,7 @@ foreach ($ws in $workspaces) {
         }
     }
     catch {
-        Write-Warning "Could not read dataflows in '$wsName': $($_.Exception.Message)"
+        Write-ReadWarning -What 'dataflows' -Workspace $wsName -Message $_.Exception.Message
     }
 }
 
@@ -386,7 +521,7 @@ Write-Host ""
 Write-Host ("Total items: {0}" -f $results.Count) -ForegroundColor Green
 
 # Show a count for every known item type, including those with zero items.
-$knownTypes = 'Report', 'PaginatedReport', 'SemanticModel', 'Dashboard', 'Dataflow'
+$knownTypes = 'Report', 'PaginatedReport', 'SemanticModel', 'Dashboard', 'Dataflow', 'Datamart'
 $counts = $results | Group-Object Type -AsHashTable -AsString
 foreach ($t in $knownTypes) {
     $c = if ($counts -and $counts.ContainsKey($t)) { $counts[$t].Count } else { 0 }

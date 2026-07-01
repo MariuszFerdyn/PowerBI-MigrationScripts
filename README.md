@@ -52,6 +52,20 @@ These can be helpful for:
 > `WARNING SetAuthorityUri ... defaulting to MsSts`. These are harmless
 > diagnostic messages from the auth library and can be safely **ignored**.
 
+> **`Unauthorized` warnings — usually harmless, but not always.** When scanning
+> workspaces you can enumerate but not read (typically other users' personal
+> workspaces via `-AllPersonalWorkspaces`), the cmdlets return
+> `Operation returned an invalid status code 'Unauthorized'` and that workspace
+> is skipped. That is expected. **However, the same message can indicate a real
+> problem** — for example an expired/insufficient token, a revoked admin role, a
+> Conditional Access / MFA block, or the read-only admin-API tenant setting being
+> disabled. Treat it as harmless only when it's isolated to personal/other
+> workspaces you don't own; if it appears for workspaces you *should* be able to
+> read, or for *all* workspaces, investigate (re-run `Connect-PowerBIServiceAccount`,
+> confirm your admin role, and check the tenant admin-API setting). To actually
+> read *inside* personal workspaces, use `-UseScannerApi` (admin metadata API)
+> rather than `-AllPersonalWorkspaces` (which cannot).
+
 > **Admin vs. user scope:** Where a script can use *Organization* (admin) scope,
 > a Fabric administrator can enumerate **all** workspaces in the tenant — even
 > ones they aren't a member of (read/enumerate visibility, not edit rights).
@@ -82,6 +96,7 @@ isn't restorable.
 | `-AllPersonalWorkspaces` | Include **every** user's personal workspace (requires Fabric admin). |
 | `-Backup` | Download `.pbix` / `.rdl` / dataflow `.json` for every exportable item. |
 | `-BackupPath <path>` | Root folder for `-Backup` output. Default: `.\PowerBIBackup_<timestamp>`. |
+| `-UseScannerApi` | Inventory via the admin **Scanner API** — reads metadata *inside* personal workspaces (and any workspace you aren't a member of). Inventory-only; can't combine with `-Backup`. Requires Fabric admin + the admin-API tenant setting. |
 
 ### Examples
 
@@ -100,7 +115,29 @@ isn't restorable.
 
 # Back up to a specific folder
 .\01-InventoryPowerBI.ps1 -Backup -BackupPath D:\PBIBackup
+
+# Inventory INCLUDING what's inside personal workspaces (admin Scanner API)
+.\01-InventoryPowerBI.ps1 -UseScannerApi
+.\01-InventoryPowerBI.ps1 -UseScannerApi -CsvPath .\pbi-inventory-full.csv
 ```
+
+### Seeing inside personal workspaces (`-UseScannerApi`)
+
+By default, the normal cmdlets can **enumerate** every workspace when you're an
+admin, but they return **`Unauthorized`** when trying to read the *contents* of
+another user's personal workspace — so those items are a blind spot.
+
+`-UseScannerApi` switches to the admin **metadata Scanner API**
+(`GetModifiedWorkspaces → PostWorkspaceInfo → GetScanStatus → GetScanResult`),
+which runs under an admin context and **can** list items inside personal
+workspaces (e.g. "Jason's workspace has 3 reports"). Important points:
+
+- **Metadata only** — you see names, types, and counts, *not* downloadable
+  files. That's why it can't be combined with `-Backup`.
+- Requires **Fabric admin** rights **and** the tenant setting that enables the
+  read-only admin APIs (Admin portal → *Admin API settings*).
+- The Scanner API is limited to **30 scan calls per hour per tenant**; the script
+  batches up to 100 workspaces per scan to stay well within that.
 
 ### What the backup can and cannot restore
 
